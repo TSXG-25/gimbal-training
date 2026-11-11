@@ -226,6 +226,7 @@ impl Axis {
         let measured_angle = self.measured_joint_angle_rad()?;
 
         let config = self.motion_config?;
+        let _max_rpm = PREPARE_MAX_RPM.min(config.max_motor_rpm);
 
         if !config.contains(measured_angle) {
             self.motor.disable();
@@ -320,8 +321,51 @@ impl Default for Control {
     fn default() -> Self {
         Self {
             state: State::Waiting,
-            yaw: Axis::default(),
-            pitch: Axis::default(),
+            // ========== YAW PID ==========
+            yaw: Axis {
+                position_pid: Pid {
+                    kp: 0.0, // Yaw 位置环 Kp
+                    ki: 0.0,
+                    kd: 0.0,
+                    maxout: 0.0, // 输出最大目标 rpm
+                    integral_limit: 0.0,
+                    ..Pid::default()
+                },
+
+                speed_pid: Pid {
+                    kp: 0.0, // Yaw 速度环 Kp
+                    ki: 0.0,
+                    kd: 0.0,
+                    maxout: 0.0, // 输出最大电压原始值
+                    integral_limit: 0.0,
+                    ..Pid::default()
+                },
+
+                ..Axis::default()
+            },
+
+            // ========== PITCH PID ==========
+            pitch: Axis {
+                position_pid: Pid {
+                    kp: 0.0, // Pitch 位置环 Kp
+                    ki: 0.0,
+                    kd: 0.0,
+                    maxout: 0.0,
+                    integral_limit: 0.0,
+                    ..Pid::default()
+                },
+
+                speed_pid: Pid {
+                    kp: 0.0, // Pitch 速度环 Kp
+                    ki: 0.0,
+                    kd: 0.0,
+                    maxout: 0.0,
+                    integral_limit: 0.0,
+                    ..Pid::default()
+                },
+
+                ..Axis::default()
+            },
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
             yaw_feedback_age_ticks: FEEDBACK_TIMEOUT_TICKS,
@@ -384,6 +428,10 @@ impl Control {
         self.yaw_feedback_age_ticks = self.yaw_feedback_age_ticks.saturating_add(1);
         self.pitch_feedback_age_ticks = self.pitch_feedback_age_ticks.saturating_add(1);
         while let Ok(received) = receiver.try_receive() {
+            let encoder = u16::from_be_bytes([data[0], data[1]]);
+            if encoder >= 8192 {
+                continue;
+            }
             match received {
                 Ok(envelope) => {
                     // TODO: check the ID and length, pass the data to the matching axis's
