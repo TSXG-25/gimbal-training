@@ -1,8 +1,10 @@
+// Stall: >=5 rpm demand, <=2 rpm feedback, >=200 voltage counts for 500 ms.
 pub const STALL_DEMAND_RPM: f32 = 5.0;
 pub const STALL_SPEED_RPM: f32 = 2.0;
 pub const STALL_OUTPUT_RAW: f32 = 200.0;
 pub const STALL_TICKS: u16 = 500;
 
+// Oscillation: errors reach both +/-0.03 rad, >10 Hz for 4 complete cycles.
 pub const OSC_AMPLITUDE_RAD: f32 = 0.03;
 pub const OSC_MAX_PERIOD_TICKS: u16 = 100;
 pub const OSC_REQUIRED_CYCLES: u8 = 4;
@@ -17,6 +19,8 @@ pub enum FaultKind {
 pub struct FaultMonitor {
     pub stall_ticks: u16,
     pub fast_cycles: u8,
+    /// Total milliseconds in completed consecutive high-frequency cycles.
+    pub fast_ticks: u16,
     pub last_period_ticks: u16,
 
     anchor_side: i8,
@@ -31,10 +35,19 @@ impl FaultMonitor {
 
     fn reset_oscillation(&mut self) {
         self.fast_cycles = 0;
+        self.fast_ticks = 0;
         self.last_period_ticks = 0;
         self.anchor_side = 0;
         self.saw_opposite = false;
         self.period_ticks = 0;
+    }
+
+    pub fn frequency_hz(&self) -> f32 {
+        if self.last_period_ticks == 0 {
+            0.0
+        } else {
+            1000.0 / self.last_period_ticks as f32
+        }
     }
 
     pub fn step(
@@ -43,7 +56,6 @@ impl FaultMonitor {
         actual_rpm: f32,
         output_abs: f32,
         angle_error: f32,
-        check_oscillation: bool,
     ) -> Option<FaultKind> {
         if !target_rpm.is_finite()
             || !actual_rpm.is_finite()
@@ -69,12 +81,6 @@ impl FaultMonitor {
             return Some(FaultKind::Stall);
         }
 
-        // 震荡
-        if !check_oscillation {
-            self.reset_oscillation();
-            return None;
-        }
-
         // 误差跨越正负两个幅度阈值
         let side = if angle_error >= OSC_AMPLITUDE_RAD {
             1
@@ -93,8 +99,8 @@ impl FaultMonitor {
 
         self.period_ticks = self.period_ticks.saturating_add(1);
 
-        // 一个完整周期必须在 100 ticks 内结束
-        if self.period_ticks > OSC_MAX_PERIOD_TICKS {
+        // A complete cycle must be shorter than 100 ms (>10 Hz).
+        if self.period_ticks >= OSC_MAX_PERIOD_TICKS {
             self.reset_oscillation();
             if side != 0 {
                 self.anchor_side = side;
@@ -109,6 +115,7 @@ impl FaultMonitor {
         } else if side == self.anchor_side {
             self.last_period_ticks = self.period_ticks;
             self.fast_cycles = self.fast_cycles.saturating_add(1);
+            self.fast_ticks = self.fast_ticks.saturating_add(self.period_ticks);
 
             self.period_ticks = 0;
             self.saw_opposite = false;
@@ -131,10 +138,10 @@ mod tests {
         let mut m = FaultMonitor::default();
 
         for _ in 0..499 {
-            assert_eq!(m.step(10.0, 0.0, 500.0, 0.0, false), None);
+            assert_eq!(m.step(10.0, 0.0, 500.0, 0.0), None);
         }
 
-        assert_eq!(m.step(10.0, 0.0, 500.0, 0.0, false), Some(FaultKind::Stall));
+        assert_eq!(m.step(10.0, 0.0, 500.0, 0.0), Some(FaultKind::Stall));
     }
 
     #[test]
@@ -142,7 +149,7 @@ mod tests {
         let mut m = FaultMonitor::default();
 
         for _ in 0..600 {
-            assert_eq!(m.step(0.0, 0.0, 500.0, 0.0, false), None);
+            assert_eq!(m.step(0.0, 0.0, 500.0, 0.0), None);
         }
     }
 
@@ -155,7 +162,7 @@ mod tests {
             // 每 20 ms 换方向，完整周期 40 ms
             let error = if (tick / 20) % 2 == 0 { 0.08 } else { -0.08 };
 
-            result = m.step(0.0, 0.0, 0.0, error, true);
+            result = m.step(0.0, 0.0, 0.0, error);
 
             if result.is_some() {
                 break;
@@ -164,6 +171,7 @@ mod tests {
 
         assert_eq!(result, Some(FaultKind::Oscillation));
         assert_eq!(m.last_period_ticks, 40);
+        assert_eq!(m.fast_ticks, 160);
     }
 
     #[test]
@@ -173,18 +181,47 @@ mod tests {
         for tick in 0..900 {
             let error = if (tick / 80) % 2 == 0 { 0.08 } else { -0.08 };
 
-            assert_eq!(m.step(0.0, 0.0, 0.0, error, true), None);
+            assert_eq!(m.step(0.0, 0.0, 0.0, error), None);
         }
     }
 
     #[test]
-    fn moving_target_disables_oscillation_check() {
+    fn motion_demand_does_not_disable_oscillation_detection() {
         let mut m = FaultMonitor::default();
-
+        let mut result = None;
         for tick in 0..200 {
             let error = if (tick / 20) % 2 == 0 { 0.08 } else { -0.08 };
-
-            assert_eq!(m.step(0.0, 0.0, 0.0, error, false), None);
+            result = m.step(3.0, 3.0, 500.0, error);
+            if result.is_some() {
+                break;
+            }
         }
+        assert_eq!(result, Some(FaultKind::Oscillation));
+        assert!((m.frequency_hz() - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn exact_10_hz_does_not_exceed_threshold() {
+        let mut m = FaultMonitor::default();
+        for tick in 0..1000 {
+            let error = if (tick / 50) % 2 == 0 { 0.08 } else { -0.08 };
+            assert_eq!(m.step(0.0, 0.0, 0.0, error), None);
+        }
+    }
+
+    #[test]
+    fn noise_and_single_overshoot_are_not_sustained_oscillation() {
+        let mut m = FaultMonitor::default();
+        for tick in 0..500 {
+            let error = if tick == 0 {
+                0.08
+            } else if tick == 20 {
+                -0.08
+            } else {
+                0.01
+            };
+            assert_eq!(m.step(0.0, 0.0, 0.0, error), None);
+        }
+        assert_eq!(m.fast_cycles, 0);
     }
 }
