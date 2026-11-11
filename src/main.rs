@@ -21,9 +21,10 @@ use running_logic::{AxisMotionConfig, next_target_angle};
 use prepare_logic::{PREPARE_MAX_RPM, PrepareOutcome, PrepareProgress, axes_settled};
 
 const DT_S: f32 = 0.001;
+const PID_TUNING_MODE: bool = true;
 
 // Adjust: whether can raise verified flag
-const HOMING_CONFIG_VERIFIED: bool = false;
+const HOMING_CONFIG_VERIFIED: bool = true;
 
 mod motor_protocol; // delete_required
 use motor_protocol::write_voltage_slot;
@@ -51,7 +52,7 @@ const YAW_FEEDBACK_ID: u16 = 0x204 + YAW_MOTOR_ID as u16;
 const PITCH_FEEDBACK_ID: u16 = 0x204 + PITCH_MOTOR_ID as u16;
 
 // Adjust: locked inut
-const BENCH_MAX_ABS_RAW: f32 = 0.0;
+const BENCH_MAX_ABS_RAW: f32 = 10.0;
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -226,7 +227,7 @@ impl Axis {
         let measured_angle = self.measured_joint_angle_rad()?;
 
         let config = self.motion_config?;
-        let _max_rpm = PREPARE_MAX_RPM.min(config.max_motor_rpm);
+        let max_rpm = PREPARE_MAX_RPM.min(config.max_motor_rpm);
 
         if !config.contains(measured_angle) {
             self.motor.disable();
@@ -241,7 +242,7 @@ impl Axis {
         self.target_rpm = self
             .position_pid
             .calculate(self.target_angle_rad, measured_angle, DT_S)
-            .clamp(-PREPARE_MAX_RPM, PREPARE_MAX_RPM);
+            .clamp(-max_rpm, max_rpm);
 
         //speed pid
         self.motor.command_voltage_raw =
@@ -323,6 +324,7 @@ impl Default for Control {
             state: State::Waiting,
             // ========== YAW PID ==========
             yaw: Axis {
+                zero_encoder_count: Some(3564),
                 position_pid: Pid {
                     kp: 0.0, // Yaw 位置环 Kp
                     ki: 0.0,
@@ -333,19 +335,28 @@ impl Default for Control {
                 },
 
                 speed_pid: Pid {
-                    kp: 0.0, // Yaw 速度环 Kp
+                    kp: 2.0, // Yaw 速度环 Kp
                     ki: 0.0,
                     kd: 0.0,
-                    maxout: 0.0, // 输出最大电压原始值
+                    maxout: 10.0, // 输出最大电压原始值
                     integral_limit: 0.0,
                     ..Pid::default()
                 },
+
+                motion_config: Some(AxisMotionConfig {
+                    min_angle_rad: -2.618,
+                    max_angle_rad: 2.618,
+                    max_target_rate_rad_s: 0.3,
+                    max_motor_rpm: 15.0,
+                    stick_direction: 1.0,
+                }),
 
                 ..Axis::default()
             },
 
             // ========== PITCH PID ==========
             pitch: Axis {
+                zero_encoder_count: Some(4110),
                 position_pid: Pid {
                     kp: 0.0, // Pitch 位置环 Kp
                     ki: 0.0,
@@ -363,6 +374,14 @@ impl Default for Control {
                     integral_limit: 0.0,
                     ..Pid::default()
                 },
+
+                motion_config: Some(AxisMotionConfig {
+                    min_angle_rad: -0.21,
+                    max_angle_rad: 0.24,
+                    max_target_rate_rad_s: 0.2,
+                    max_motor_rpm: 10.0,
+                    stick_direction: 1.0,
+                }),
 
                 ..Axis::default()
             },
@@ -428,10 +447,6 @@ impl Control {
         self.yaw_feedback_age_ticks = self.yaw_feedback_age_ticks.saturating_add(1);
         self.pitch_feedback_age_ticks = self.pitch_feedback_age_ticks.saturating_add(1);
         while let Ok(received) = receiver.try_receive() {
-            let encoder = u16::from_be_bytes([data[0], data[1]]);
-            if encoder >= 8192 {
-                continue;
-            }
             match received {
                 Ok(envelope) => {
                     // TODO: check the ID and length, pass the data to the matching axis's
@@ -452,6 +467,11 @@ impl Control {
                         Ok(bytes) => bytes,
                         Err(_) => continue,
                     };
+                    let encoder = u16::from_be_bytes([data[0], data[1]]);
+
+                    if encoder >= 8192 {
+                        continue;
+                    }
 
                     // Assign to motors based on CAN id
                     match can_id {
@@ -512,7 +532,11 @@ impl Control {
                 if remote.right_switch == 2 {
                     self.enable_armed = true;
                 } else if remote.right_switch == 3 && self.enable_armed {
-                    self.enter_prepare();
+                    if PID_TUNING_MODE {
+                        self.enter_pid_tuning();
+                    } else {
+                        self.enter_prepare();
+                    }
                 } else if remote.right_switch == 1 {
                     self.enable_armed = false;
                 }
@@ -670,6 +694,57 @@ impl Control {
         if can.writer().try_write(frame).is_err() {
             TX_FAILED.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn enter_pid_tuning(&mut self) {
+        let (Some(yaw_angle), Some(pitch_angle)) = (
+            self.yaw.measured_joint_angle_rad(),
+            self.pitch.measured_joint_angle_rad(),
+        ) else {
+            self.enable_armed = false;
+            return;
+        };
+
+        // 检查当前角度是否在配置的活动范围内
+        let (Some(yaw_config), Some(pitch_config)) =
+            (self.yaw.motion_config, self.pitch.motion_config)
+        else {
+            self.enable_armed = false;
+            return;
+        };
+
+        if !yaw_config.contains(yaw_angle) || !pitch_config.contains(pitch_angle) {
+            self.enable_armed = false;
+            return;
+        }
+
+        // 不自动回零：当前位置就是初始目标
+        self.yaw.target_angle_rad = yaw_angle;
+        self.pitch.target_angle_rad = pitch_angle;
+
+        self.yaw.target_rpm = 0.0;
+        self.pitch.target_rpm = 0.0;
+
+        // 清除四套 PID 的历史值
+        self.yaw.position_pid.reset();
+        self.yaw.speed_pid.reset();
+        self.pitch.position_pid.reset();
+        self.pitch.speed_pid.reset();
+
+        self.prepare_progress.reset();
+        self.yaw_fault.reset();
+        self.pitch_fault.reset();
+
+        self.disable_all();
+
+        self.enable_armed = false;
+        self.state = State::Running;
+
+        rtt_target::rprintln!(
+            "PID tuning started: yaw={:.3}, pitch={:.3}",
+            yaw_angle,
+            pitch_angle
+        );
     }
 
     fn enter_prepare(&mut self) {
